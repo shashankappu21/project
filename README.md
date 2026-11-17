@@ -23,14 +23,15 @@ Vite · Tailwind 4 · TradingView lightweight-charts · Docker · GitHub Actions
 |---|---|
 | HTTP endpoints | **16** REST operations + **1** WebSocket (`/ws`) — documented at `/docs` (Swagger) |
 | Database tables | **7** (`users`, `instruments`, `daily_prices`, `orders`, `order_events`, `holdings`, `cash_ledger`) |
-| Tests | **127** Jest tests (51 unit, 76 integration against real Postgres/Redis/BullMQ) · 90% statement coverage |
+| Tests | **140** Jest tests (59 unit, 81 integration against real Postgres/Redis/BullMQ) · 90% statement coverage · CI green |
 | Load test (k6, 50 VUs) | **353 req/s**, order placement **p95 105 ms**, **0 errors** in 31,240 requests |
 | Execution latency | API accept → worker fill: **p50 23 ms, p95 40 ms** (21,756 market orders) |
 | Correctness under load | **0** ledger/holding/event-trail violations across 27,924 orders |
 
 📖 **Deeper reading:** [Build journal — decisions and challenges](docs/JOURNEY.md) ·
 [Design decisions (ADRs)](docs/DECISIONS.md) · [Load testing report](docs/LOAD_TESTING.md) ·
-[Deployment guide (EC2 + Caddy + Vercel)](docs/DEPLOYMENT.md) · [EC2 via SSM + CloudFormation](docs/AWS_SETUP.md) ·
+[**Free deployment (Render + Neon + Redis Cloud + Vercel)**](docs/FREE_DEPLOYMENT.md) ·
+[Self-hosted deployment (EC2 + Caddy)](docs/DEPLOYMENT.md) · [EC2 via SSM + CloudFormation](docs/AWS_SETUP.md) ·
 [Interview prep](docs/INTERVIEW_PREP.md)
 
 ---
@@ -229,7 +230,7 @@ debugging; tests use this mode for the service-level suites).
 
 | Command | |
 |---|---|
-| `npm test` | All 125 tests (needs Postgres + Redis; uses `trading_test` and Redis DB 15) |
+| `npm test` | All 140 tests (needs Postgres + Redis; uses `trading_test` and Redis DB 15) |
 | `npm run test:unit` | Pure domain tests only, no infrastructure |
 | `npm run lint` · `npm run typecheck` | ESLint · `tsc -b` for every package + web |
 | `npm run migrate` · `npm run seed` | Apply migrations · seed (both idempotent) |
@@ -291,18 +292,19 @@ Written **test-first** for the order logic: the specs were committed red
 | `core-unit` · state machine | 38 | All 36 from→to pairs: 7 allowed, 29 rejected with `INVALID_STATE_TRANSITION`; terminal states |
 | `core-unit` · P&L math | 8 | Average-cost method, realised/unrealised P&L, **no paise lost across partial sells** |
 | `core-unit` · pre-trade checks | 5 | Buying power to the paisa, reserved sell quantity |
-| `core-integration` · order flow | 27 | Market/limit fills, insufficient funds/holdings, cash blocking, cancellation, duplicate & **concurrent** idempotency keys, concurrent overspend, retries, P&L |
-| `core-integration` · auth, market data, ingest | 13 | bcrypt + JWT, Redis TTL, **single-flight** cache stampede protection, stale fallback, concurrent ingest count |
-| `api` | 28 | HTTP contract, error envelope, request-id echo, rate limits, OpenAPI coverage, WebSocket fan-out and auth |
+| `core-unit` · market hours | 8 | NSE session boundaries (09:15–15:30 IST, weekends) for market-hours-aware polling |
+| `core-integration` · order flow | 28 | Market/limit fills, insufficient funds/holdings, cash blocking, cancellation, duplicate & **concurrent** idempotency keys, concurrent overspend, retries, P&L, **exit-only after an index change** |
+| `core-integration` · auth, market data, ingest | 15 | bcrypt + JWT, Redis TTL, **single-flight** cache stampede protection, stale fallback, Redis command budget, concurrent ingest count, universe sync |
+| `api` | 32 | HTTP contract, error envelope, request-id echo, rate limits, OpenAPI coverage, WebSocket fan-out and auth, cron-secret job triggers |
 | `worker` | 6 | Real BullMQ: async fill, request-id across the hop, job dedupe, **reconciler recovers a lost enqueue**, EOD job |
-| **Total** | **125** | 90.3% statements · 92.3% lines |
+| **Total** | **140** | 89.9% statements · 91.5% lines |
 
 Integration tests run against **real PostgreSQL and Redis** (CI uses service containers). The correctness of
 this system lives in constraints, row locks and transactions — mocking the database would test nothing.
 
 ```
-Test Suites: 11 passed, 11 total
-Tests:       125 passed, 125 total
+Test Suites: 13 passed, 13 total
+Tests:       140 passed, 140 total
 ```
 
 ## Load test results (k6)
@@ -370,8 +372,19 @@ the `ExecutionService`, not a redesign.
 
 ## Deployment
 
-Single **AWS EC2** instance running the Compose stack with **Caddy** for automatic HTTPS, frontend on **Vercel**.
-Step-by-step guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+### Free (US$0): Render + Neon + Redis Cloud + Vercel
+
+The recommended way to host the demo. [`render.yaml`](render.yaml) is a Render Blueprint for one free web
+service that runs the API **and** the BullMQ worker in one process (`RUN_WORKER=true`), migrates and seeds
+itself on boot, and gets its daily 16:00 IST job from a GitHub Actions cron through a secret-protected
+`/internal/jobs` endpoint (free instances sleep when idle). Postgres on Neon, Redis on Redis Cloud, frontend on
+Vercel. Step-by-step setup, the free-tier trade-offs, and how each piece was verified:
+**[docs/FREE_DEPLOYMENT.md](docs/FREE_DEPLOYMENT.md)**.
+
+### Self-hosted: one VM with Docker Compose + Caddy
+
+The full multi-service stack (separate worker, Redis with AOF, automatic HTTPS) on any single VM, e.g. AWS EC2
+([guide](docs/DEPLOYMENT.md), [one-click CloudFormation](docs/AWS_SETUP.md)):
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build

@@ -21,6 +21,8 @@ that were considered, and the consequences — including the costs.
 | [014](#adr-014-integration-tests-against-real-postgres-and-redis) | Integration tests against real Postgres and Redis |
 | [015](#adr-015-openapi-generated-from-zod) | OpenAPI generated from zod |
 | [016](#adr-016-single-ec2-host-with-docker-compose-and-caddy) | Single EC2 host with Docker Compose and Caddy |
+| [017](#adr-017-free-tier-hosting-with-an-in-process-worker-and-external-cron) | Free-tier hosting with an in-process worker and external cron |
+| [018](#adr-018-stocks-that-leave-the-index-become-exit-only) | Stocks that leave the index become exit-only |
 
 ---
 
@@ -227,3 +229,36 @@ Kubernetes (far more than needed).
 **Consequences.** + Cheap (~US$20/month), reproducible, shows real operational concerns (TLS, health-gated
 startup, migrations on deploy, non-root images). − Single point of failure; vertical scaling only. Nothing in
 the application assumes one host — the upgrade is infrastructure, not code.
+
+## ADR-017: Free-tier hosting with an in-process worker and external cron
+
+**Context.** Hosting must cost nothing. Free compute tiers (Render) offer one web service that sleeps after
+15 idle minutes, with no background workers and no pre-deploy hooks.
+
+**Decision.** Deploy one Render web service that runs the API and, with `RUN_WORKER=true`, the same BullMQ
+consumers and schedulers in-process. Migrate on start (`MIGRATE_ON_START`); seed idempotently in the background
+(`SEED_ON_START`). A GitHub Actions cron wakes the service at 16:00 IST and enqueues `eod-close` through
+`POST /internal/jobs/:job` guarded by `CRON_SECRET`. Postgres on Neon, Redis on Redis Cloud (not Upstash,
+whose command quota doesn't suit BullMQ's idle traffic), frontend on Vercel.
+
+**Alternatives.** Oracle Always Free VM running the full Compose stack (always on, but needs a card and
+capacity is unreliable); paid Render worker (costs money); a rewrite to serverless functions plus a hosted
+queue (would remove the BullMQ worker and the WebSocket feed, which are central to the project).
+
+**Consequences.** + US$0, same code paths, and switching back to a dedicated worker is configuration only
+(`RUN_WORKER=false` + deploy `apps/worker`). − Cold starts (~1 min); queued work and polling only run while
+awake; the API and worker share 0.1 CPU. Idempotent jobs make the cron-plus-scheduler double trigger safe.
+
+## ADR-018: Stocks that leave the index become exit-only
+
+**Context.** The NIFTY 50 is rebalanced twice a year (September 2026: BSE in, Wipro out). Users may hold a
+stock that leaves.
+
+**Decision.** `syncUniverse()` keeps removed instruments but marks them inactive. Inactive instruments reject
+BUY orders (`INSTRUMENT_NOT_TRADABLE`) and still accept SELL orders.
+
+**Alternatives.** Delete the instrument (breaks foreign keys from orders and holdings); keep it fully tradable
+(the "NIFTY 50" grows forever); block all trading (traps users' holdings).
+
+**Consequences.** + Matches broker behaviour for restricted scrips; history stays intact. − Retired stocks
+aren't polled for live quotes; their holdings are valued from the cache or last known price.

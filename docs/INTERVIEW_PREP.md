@@ -79,7 +79,7 @@ have heartbeats and slow-consumer protection.
 **How did you test? Why real databases?**
 Domain logic (state machine, P&L, checks) has pure unit tests. Everything else runs against real Postgres, Redis
 and BullMQ, because the correctness lives in constraints, locks and transactions — a mocked DB can't fail a
-unique constraint. 125 tests, 90% statement coverage. The order specs were committed red before implementation.
+unique constraint. 140 tests, 90% statement coverage, green in GitHub Actions. The order specs were committed red before implementation.
 
 **What did the load test show?**
 353 req/s with 50 VUs, p95 105 ms, zero errors; async fill latency p95 40 ms. At 200 VUs a single API pegs its
@@ -121,5 +121,18 @@ supposed to reveal.
 
 ## Numbers cheat-sheet
 
-16 REST endpoints + 1 WebSocket · 7 tables · 125 tests (90% coverage) · 353 req/s, p95 105 ms, 0 errors ·
+16 REST endpoints + 1 WebSocket · 7 tables · 140 tests (90% coverage, CI green) · 353 req/s, p95 105 ms, 0 errors ·
 fill latency p95 40 ms · 0 invariant violations / 27,924 orders · ~70 MB images · 4 stages.
+
+**How is it hosted, and what did that cost?**
+Nothing. One free Render web service runs the API *and* the BullMQ worker in one process (`RUN_WORKER=true`).
+Postgres is on Neon, Redis on Redis Cloud, the frontend on Vercel. Free Render instances sleep when idle, so a
+GitHub Actions cron wakes the API at 16:00 IST and enqueues the end-of-day job through a secret-protected
+endpoint. I picked Redis Cloud over Upstash because Upstash's free tier meters commands and BullMQ generates
+traffic even when idle. The same code runs as separate services under Docker Compose; switching is
+configuration, not code. (ADR-017)
+
+**What happens when a stock leaves the NIFTY 50?**
+It happened while I was building: Wipro was replaced by BSE in September 2026. Seeding only added instruments,
+so the index silently grew to 51 stocks; a test caught it. Retired stocks are now exit-only: buys are rejected,
+sells still fill, so nobody's holdings get trapped. (ADR-018)

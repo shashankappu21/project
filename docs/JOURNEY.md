@@ -9,7 +9,8 @@ hit along the way* — with the symptom, the root cause, the fix, and the lesson
 - [Stage 2 — moving execution into a BullMQ worker](#stage-2--moving-execution-into-a-bullmq-worker)
 - [Stage 3 — the frontend and live prices](#stage-3--the-frontend-and-live-prices)
 - [Stage 4 — production readiness](#stage-4--production-readiness)
-- [Challenge log (all 28, in one table)](#challenge-log)
+- [Stage 5 — shipping it: CI, an index rejig, a free deployment](#stage-5--shipping-it-ci-for-real-an-index-rejig-and-a-free-deployment)
+- [Challenge log (all of them, in one table)](#challenge-log)
 - [What I would do next](#what-i-would-do-next)
 - [Numbers to remember](#numbers-to-remember)
 
@@ -462,6 +463,104 @@ until it looked good.
 
 ---
 
+## Stage 5 — shipping it: CI for real, an index rejig, and a free deployment
+
+**Built:** the first real CI run, a fix for NIFTY 50 index changes, AWS tooling (later shelved), and a
+**US$0 deployment**: Render + Neon + Redis Cloud + Vercel, with a GitHub Actions cron.
+
+### Getting it onto GitHub, and CI's first run
+
+Once the Claude GitHub App was installed on the repository, the 11 local commits were pushed and **GitHub
+Actions ran for the first time: all four jobs green on the first attempt.** That covered lint, type-check, the
+full test suite against Postgres/Redis service containers, the web build, and the api/worker/web Docker images.
+Until then CI had only ever been validated as YAML, so this closed the biggest "never actually ran" gap.
+
+### The NIFTY 50 changed under us
+
+A web search for the current constituents found that NSE's September 2026 review **replaced Wipro with BSE
+Ltd**. Updating the list was easy. The interesting part was what the change exposed:
+
+**26. A test failed because the database remembered Wipro.**
+*Symptom:* the ingest test expected 250 candles (50 symbols × 5 days) and got 255. *Cause:* seeding only
+*upserted* instruments and never retired removed ones, so the "NIFTY 50" quietly became 51 stocks. Index
+reviews happen twice a year, so this would recur. *Fix:* `syncUniverse()` upserts the current members and
+marks the rest inactive. *Design decision:* a retired stock is **exit-only**. BUY orders are rejected with
+`INSTRUMENT_NOT_TRADABLE`, but SELLs still fill, so users holding Wipro aren't trapped. That mirrors how a
+broker treats a restricted scrip. Tests cover both the sync and the exit-only behaviour.
+
+### AWS, then not AWS
+
+The plan was a single EC2 host. Two discoveries reshaped it:
+
+**27. The sandbox can't SSH anywhere** (outbound port 22 is blocked), but it **can** reach AWS APIs over HTTPS.
+So I designed for **SSM Run Command** instead of SSH: a CloudFormation template (EC2 with IMDSv2 and an
+encrypted disk, an 80/443-only security group, an SSM instance role, a private S3 artifact bucket, and an
+operator IAM policy scoped to *that one instance*), a `ssm-run.sh` helper (tested against a stubbed `aws` CLI
+for polling, output and exit-code propagation), and `ship.sh`, which delivers unpushed commits as a `git bundle`
+through S3. `cfn-lint` clean. It's kept as the self-hosted option.
+
+**28. "Don't spend AWS credits."** The deciding requirement was cost: free, or not at all. That ruled out EC2
+and led to the free-tier design below. The lesson for the story: the architecture didn't change. Only where it
+runs did, plus two settings that the hosting forced.
+
+### The free-tier design
+
+Research on current free tiers (they change often, so I checked rather than relied on memory) gave:
+
+- **Postgres → Neon Free**: 1 GB per project, scale-to-zero, no card.
+- **Redis → Redis Cloud Free (30 MB), not Upstash.** Upstash's free plan caps usage at 500K commands a month,
+  and BullMQ keeps traffic flowing even when idle (users report millions of commands a month on idle queues).
+  A command quota is the wrong shape for a queue.
+- **Compute → Render free web service.** It has two constraints: **no free background workers**, and it
+  **sleeps after 15 minutes idle**. (Oracle's Always Free VM would run Compose unchanged, but needs a card and
+  capacity is unreliable.)
+- **Frontend → Vercel Hobby.**
+
+Each constraint got a small, explicit feature rather than a hack:
+
+| Constraint | Feature |
+|---|---|
+| No free worker service | `RUN_WORKER=true` starts the *same* BullMQ consumers and schedulers inside the API process. To make that possible without one app importing another, `createWorkers`/`registerSchedules` moved from `apps/worker` into `packages/core`. Both deployables now just wire them up. |
+| No pre-deploy step | `MIGRATE_ON_START=true`. The advisory lock built in Stage 1 makes concurrent boots safe, so the earlier design paid off. |
+| Sleeps when idle, so Redis-stored schedules can't fire | `POST /internal/jobs/:job`, protected by `CRON_SECRET` (constant-time compare of SHA-256 digests; returns **404** when no secret is configured, so the route doesn't even exist). A GitHub Actions workflow wakes the API at 16:00 IST and enqueues `eod-close`. If the BullMQ scheduler also fires while awake, the job runs twice, which is harmless because EOD is idempotent. |
+| Empty managed database | `SEED_ON_START=true` runs a shared `bootstrapData()` (also used by `npm run seed`) in the background after `listen`, so health checks pass while candles load. It ingests **only missing days** on restarts. |
+| Free Redis ops/sec cap | A quote refresh used **2 commands per symbol**; last-known prices now live in **one hash** written by a single `HSET`, so it's N + 1. A test reads `total_commands_processed` on the real server to lock that in. Polling is also **market-hours aware**: outside 09:15–15:30 IST on weekdays, at most every 10 minutes. |
+
+**29. Is the Redis URL really honoured?** A hosted Redis URL carries a host, port, password and TLS. A quick
+check showed **ioredis silently ignores a `url` key in its options object** and falls back to `localhost:6379`.
+That's exactly how a local test could pass while production broke. Reading BullMQ's source showed it
+explicitly unpacks `url` and passes it to ioredis as the connection string, and our own clients use the string
+form. So there was no bug. But I verified it, including a `rediss://user:pass@host:port` URL, rather than
+assume it.
+
+**30. The Docker health check hard-coded port 4000.** Render injects its own `PORT` (10000). The `HEALTHCHECK`
+now uses shell form with `${PORT:-4000}`. Found by running the image with Render's settings, not by reading it.
+
+**31. `sslmode=require` doesn't mean what it says in node-postgres.** Recent `pg` treats it as `verify-full`
+and prints a deprecation warning. Neon's certificates are publicly trusted, so the guide asks for
+`sslmode=verify-full` explicitly. `channel_binding=require` in Neon's URL is ignored by the parser, so pasting
+Neon's default string doesn't break anything.
+
+### Verifying a deployment without the accounts
+
+The sandbox can't create Render, Neon or Redis Cloud accounts, so everything that *could* be proven locally was:
+
+1. `render.yaml` validated against **Render's published JSON schema**; workflows against GitHub's schema.
+2. The **production image** run exactly as Render would run it (`PORT=10000`, in-process worker, migrate and
+   seed on start) against an **empty** database: healthy, non-root, migrated, seeded, queued orders filled.
+3. A **restart** shown to be incremental and idempotent: 0 migrations, about 7 days of candles, still 6 demo orders.
+4. The **cron endpoint**: 404 without a secret, 401 with a wrong one, 202 with the right one, and `eod complete`
+   in the logs.
+5. The **frontend built the way Vercel builds it** (`VITE_API_URL` on another origin), served from a different
+   port and driven in Chromium. REST and the WebSocket both went cross-origin, the CORS preflight allowed
+   `Idempotency-Key`, unknown origins got no CORS headers, and a market order was filled through the queue and
+   confirmed over the socket.
+
+**Stage 5 result:** 140 tests green locally and in CI; a free deployment that's one Blueprint click plus three
+pasted connection strings ([FREE_DEPLOYMENT.md](FREE_DEPLOYMENT.md)).
+
+---
+
 ## Challenge log
 
 | # | Stage | Problem | Root cause | Fix |
@@ -491,6 +590,12 @@ until it looked good.
 | 23 | 4 | Endpoint count wrong | My miscount | Spec-generated test is the truth |
 | 24 | 4 | Noisy benchmark | Tests running concurrently | Re-run on idle host |
 | 25 | 4 | 3× replicas → +13% | Postgres/host CPU bound | Analysed and documented |
+| 26 | 5 | NIFTY 50 had 51 members | Seed never retired removed stocks | `syncUniverse()`; retired stocks exit-only |
+| 27 | 5 | Can't SSH to a VM | Sandbox blocks port 22 | SSM Run Command + CloudFormation (kept as option) |
+| 28 | 5 | "Don't spend credits" | Cost requirement | Free tiers: Render + Neon + Redis Cloud + Vercel |
+| 29 | 5 | Would hosted Redis URLs work? | ioredis ignores `url` in options | Verified BullMQ unpacks it; string form everywhere |
+| 30 | 5 | Health check on wrong port | `HEALTHCHECK` hard-coded 4000 | `${PORT:-4000}` (shell form) |
+| 31 | 5 | Confusing `sslmode` semantics | pg treats `require` as `verify-full` | Document `verify-full` |
 
 ---
 
@@ -518,9 +623,9 @@ In priority order, each grounded in something measured or observed above:
 |---|---|
 | Endpoints | 16 REST + 1 WebSocket |
 | Tables | 7 |
-| Tests | 125 (51 unit, 74 integration) · 90% statements |
+| Tests | 140 (59 unit, 81 integration) · 90% statements · CI green |
 | Throughput (1 API, 50 VUs) | 353 req/s, p95 105 ms, 0 errors |
 | Async fill latency | p50 23 ms, p95 40 ms |
 | Correctness under load | 0 violations / 27,924 orders |
 | Image size | ~70 MB compressed |
-| Commits | one per stage (+ the red TDD commit) |
+| Hosting | US$0: Render + Neon + Redis Cloud + Vercel + GitHub Actions cron |
