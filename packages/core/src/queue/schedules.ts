@@ -1,5 +1,7 @@
 import type { Queue } from 'bullmq';
-import { getLogger, type Config, type EodJobData } from '@nse/core';
+import type { Config } from '../config';
+import { getLogger } from '../logger';
+import type { EodJobData } from './queues';
 
 /**
  * Repeatable jobs live in Redis as BullMQ job schedulers, so running several worker

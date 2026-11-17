@@ -1,0 +1,61 @@
+name: Scheduled jobs
+
+# The free Render instance sleeps when idle, so Redis-stored BullMQ schedules can't fire while it's
+# asleep. This workflow wakes the API and enqueues the end-of-day job through the authenticated
+# /internal/jobs endpoint; the in-process worker then runs it. Both paths are idempotent, so the
+# job running twice (cron + BullMQ scheduler while awake) is harmless.
+#
+# Setup (repo Settings -> Secrets and variables -> Actions):
+#   variable API_BASE_URL = https://<your-service>.onrender.com
+#   secret   CRON_SECRET  = the CRON_SECRET value Render generated
+on:
+  schedule:
+    - cron: '30 10 * * 1-5' # 16:00 IST, after the 15:30 NSE close (GitHub cron is UTC and can run late)
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job to run
+        type: choice
+        options: [eod-close, quote-poll, reconcile]
+        default: eod-close
+      date:
+        description: IST trading date for eod-close (YYYY-MM-DD); empty = today
+        required: false
+
+permissions: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      JOB: ${{ inputs.job || 'eod-close' }}
+      DATE: ${{ inputs.date }}
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "$API_BASE_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "::notice::Scheduled jobs are disabled until the API_BASE_URL variable and CRON_SECRET secret are set."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wake the API (cold start can take ~1 minute)
+        if: steps.cfg.outputs.enabled == 'true'
+        run: curl -fsS --retry 10 --retry-delay 15 --retry-all-errors --max-time 90 "$API_BASE_URL/health"
+
+      - name: Enqueue ${{ env.JOB }}
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          case "$JOB" in eod-close|quote-poll|reconcile) ;; *) echo "unknown job"; exit 1;; esac
+          body='{}'
+          if [ -n "$DATE" ]; then
+            [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "date must be YYYY-MM-DD"; exit 1; }
+            body="{\"date\":\"$DATE\"}"
+          fi
+          curl -fsS --retry 3 --retry-all-errors -X POST "$API_BASE_URL/internal/jobs/$JOB" \
+            -H "Authorization: Bearer $CRON_SECRET" -H 'Content-Type: application/json' -d "$body"

@@ -5,12 +5,13 @@ import { getLogger } from '../logger';
 import { QUOTES_CHANNEL, type PriceProvider, type QuoteSource } from './types';
 
 const freshKey = (s: string) => `quote:${s}`;
-const lastKey = (s: string) => `quote:last:${s}`;
+/** One hash for all last-known prices: a refresh writes it with a single HSET instead of 50 SETs. */
+const LAST_KEY = 'quote:last';
 
 /**
  * Read-through cache for quotes.
  *  - quote:{SYM}       short TTL; what order fills use
- *  - quote:last:{SYM}  no TTL; last known price, used for display if the provider is down
+ *  - quote:last        hash, no TTL; last known price per symbol, used for display if the provider is down
  * Concurrent misses for the same symbols share one provider call (single-flight),
  * so a burst of orders cannot stampede Yahoo.
  */
@@ -56,7 +57,7 @@ export class MarketDataService implements QuoteSource {
     }
     const stillMissing = misses.filter((s) => !out.has(s));
     if (stillMissing.length > 0) {
-      const stale = await this.redis.mget(stillMissing.map(lastKey));
+      const stale = await this.redis.hmget(LAST_KEY, ...stillMissing);
       stillMissing.forEach((s, i) => {
         const v = stale[i];
         if (v) out.set(s, JSON.parse(v) as QuoteDto);
@@ -81,12 +82,15 @@ export class MarketDataService implements QuoteSource {
     const p = (async () => {
       const quotes = await this.provider.getQuotes(symbols);
       if (quotes.length > 0) {
+        // N + 1 commands per refresh (matters on free hosted Redis plans with ops/sec caps).
         const pipe = this.redis.pipeline();
+        const last: Record<string, string> = {};
         for (const q of quotes) {
           const json = JSON.stringify(q);
           pipe.set(freshKey(q.symbol), json, 'EX', this.ttlSeconds);
-          pipe.set(lastKey(q.symbol), json);
+          last[q.symbol] = json;
         }
+        pipe.hset(LAST_KEY, last);
         await pipe.exec();
       }
       return quotes;

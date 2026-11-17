@@ -75,3 +75,18 @@ describe('MarketDataService (Redis cache)', () => {
     await sub.quit();
   });
 });
+
+describe('MarketDataService command budget', () => {
+  it('a refresh of N symbols costs N + 1 Redis commands (one SET EX each + one HSET)', async () => {
+    const redis = new Redis(config.REDIS_URL);
+    await redis.flushdb();
+    const before = Number((await redis.info('stats')).match(/total_commands_processed:(\d+)/)![1]);
+    const svc = new MarketDataService(redis, new CountingProvider(), 15);
+    await svc.refresh(['TCS', 'INFY', 'ITC', 'SBIN', 'BSE']);
+    const after = Number((await redis.info('stats')).match(/total_commands_processed:(\d+)/)![1]);
+    // INFO itself counts as one processed command between the two readings.
+    expect(after - before - 1).toBe(5 + 1);
+    expect(await redis.hkeys('quote:last')).toHaveLength(5);
+    await redis.quit();
+  });
+});

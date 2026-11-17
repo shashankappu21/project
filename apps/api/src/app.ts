@@ -12,6 +12,7 @@ import { requestId } from './middleware/requestId';
 import { buildOpenApiDocument } from './openapi';
 import { authRoutes } from './routes/auth';
 import { healthRoutes } from './routes/health';
+import { internalRoutes } from './routes/internal';
 import { instrumentRoutes, quoteRoutes } from './routes/instruments';
 import { orderRoutes } from './routes/orders';
 import { portfolioRoutes } from './routes/portfolio';
@@ -58,6 +59,7 @@ export function createApp(c: Container): Express {
   v1.use('/orders', authenticate(c.auth), orderRoutes(c));
   v1.use('/portfolio', authenticate(c.auth), portfolioRoutes(c));
   app.use('/api/v1', v1);
+  app.use('/internal', internalRoutes(c));
 
   app.use(notFound);
   app.use(errorHandler);

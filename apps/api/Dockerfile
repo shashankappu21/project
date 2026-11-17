@@ -46,6 +46,7 @@ COPY --from=build --chown=node:node /app/apps/api/dist apps/api/dist
 # The official image ships an unprivileged "node" user (uid 1000).
 USER node
 EXPOSE 4000
+# Shell form so ${PORT} expands: platforms like Render inject their own port.
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:4000/health >/dev/null || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT:-4000}/health" >/dev/null || exit 1
 CMD ["node", "apps/api/dist/server.js"]

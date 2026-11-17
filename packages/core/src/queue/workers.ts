@@ -1,18 +1,14 @@
 import { Worker, type ConnectionOptions, type Job } from 'bullmq';
-import {
-  ORDER_QUEUE,
-  SCHEDULED_QUEUE,
-  getLogger,
-  instrumentsRepo,
-  runWithContext,
-  type EodJobData,
-  type EodService,
-  type ExecuteOrderJob,
-  type ExecutionService,
-  type MarketDataService,
-  type OrderService,
-  type Pool,
-} from '@nse/core';
+import type { Pool } from '../db/pool';
+import { getLogger, runWithContext } from '../logger';
+import { isNseOpen } from '../market/marketHours';
+import type { MarketDataService } from '../market/marketDataService';
+import { instrumentsRepo } from '../repositories/instrumentsRepo';
+import type { ExecuteOrderJob } from '../services/dispatcher';
+import type { EodService } from '../services/eodService';
+import type { ExecutionService } from '../services/executionService';
+import type { OrderService } from '../services/orderService';
+import { ORDER_QUEUE, SCHEDULED_QUEUE, type EodJobData } from './queues';
 
 export interface WorkerDeps {
   pool: Pool;
@@ -28,6 +24,8 @@ export interface WorkerOptions {
   concurrency?: number;
   /** VALIDATED orders older than this are re-dispatched by the reconciler. */
   staleAfterMs?: number;
+  /** Outside NSE hours prices barely move: refresh at most this often (default 10 min). */
+  offHoursPollMs?: number;
 }
 
 /**
@@ -38,6 +36,7 @@ export interface WorkerOptions {
  */
 export function createWorkers(deps: WorkerDeps, opts: WorkerOptions): { workers: Worker[]; close(): Promise<void> } {
   let symbols: string[] | null = null;
+  let lastPoll = 0;
   const activeSymbols = async () => (symbols ??= (await instrumentsRepo.listActive(deps.pool)).map((i) => i.symbol));
 
   const orderWorker = new Worker<ExecuteOrderJob>(
@@ -59,6 +58,12 @@ export function createWorkers(deps: WorkerDeps, opts: WorkerOptions): { workers:
           case 'eod-close':
             return deps.eod.run(job.data?.date);
           case 'quote-poll': {
+            // Be polite to the data provider (and to free-tier Redis quotas) when the market is shut.
+            const now = Date.now();
+            if (!isNseOpen(new Date(now)) && now - lastPoll < (opts.offHoursPollMs ?? 10 * 60_000)) {
+              return { skipped: 'market closed' };
+            }
+            lastPoll = now;
             const quotes = await deps.marketData.refresh(await activeSymbols(), { publish: true });
             return { quotes: quotes.length };
           }

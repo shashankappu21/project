@@ -17,6 +17,7 @@ import {
   createOrderQueue,
   createPool,
   createScheduledQueue,
+  createWorkers,
   istDateString,
   loadConfig,
   redisOrderNotifier,
@@ -27,7 +28,6 @@ import {
   type Pool,
   type PriceProvider,
 } from '@nse/core';
-import { createWorkers } from '../src/workers';
 
 const config = loadConfig();
 

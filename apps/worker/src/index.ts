@@ -13,12 +13,12 @@ import {
   createOrderQueue,
   createPool,
   createScheduledQueue,
+  createWorkers,
   loadConfig,
   redisOrderNotifier,
+  registerSchedules,
   rootLogger,
 } from '@nse/core';
-import { registerSchedules } from './schedules';
-import { createWorkers } from './workers';
 
 async function main(): Promise<void> {
   const config = loadConfig();

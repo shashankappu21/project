@@ -1,3 +1,4 @@
+import type { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import {
   AuthService,
@@ -12,8 +13,10 @@ import {
   YahooPriceProvider,
   createOrderQueue,
   createPool,
+  createScheduledQueue,
   redisOrderNotifier,
   type Config,
+  type EodJobData,
   type OrderDispatcher,
   type Pool,
   type PriceProvider,
@@ -30,6 +33,8 @@ export interface Container {
   orders: OrderService;
   portfolio: PortfolioService;
   instruments: InstrumentService;
+  /** BullMQ queue for scheduled jobs (EOD, quote polling, reconcile); created on first use. */
+  scheduledQueue(): Queue<EodJobData>;
   close(): Promise<void>;
 }
 
@@ -47,6 +52,8 @@ export function buildContainer(config: Config, overrides: { dispatcher?: OrderDi
       ? new QueueDispatcher(orderQueue)
       : new SyncDispatcher(new ExecutionService(pool, marketData, redisOrderNotifier(redis))));
 
+  let scheduled: Queue<EodJobData> | null = null;
+
   return {
     config,
     pool,
@@ -57,8 +64,13 @@ export function buildContainer(config: Config, overrides: { dispatcher?: OrderDi
     orders: new OrderService(pool, marketData, dispatcher),
     portfolio: new PortfolioService(pool, marketData),
     instruments: new InstrumentService(pool, marketData),
+    scheduledQueue() {
+      scheduled ??= createScheduledQueue(config.REDIS_URL);
+      return scheduled;
+    },
     async close() {
       await orderQueue?.close();
+      await scheduled?.close();
       await Promise.allSettled([pool.end(), redis.quit()]);
     },
   };

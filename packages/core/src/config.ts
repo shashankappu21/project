@@ -1,5 +1,11 @@
 import { z } from 'zod';
 
+/** Env booleans arrive as strings; only "true"/"1" enable a flag. */
+const flag = z
+  .enum(['true', 'false', '1', '0', ''])
+  .default('false')
+  .transform((v) => v === 'true' || v === '1');
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
@@ -20,6 +26,15 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default('http://localhost:5173'),
   RATE_LIMIT_AUTH_PER_MIN: z.coerce.number().int().positive().default(20),
   RATE_LIMIT_ORDERS_PER_MIN: z.coerce.number().int().positive().default(120),
+  /** Run the BullMQ consumers + schedulers inside the API process (single free-tier service). */
+  RUN_WORKER: flag,
+  /** Apply migrations before the API starts listening (for hosts without a release/pre-deploy step). */
+  MIGRATE_ON_START: flag,
+  /** After start-up, idempotently sync the NIFTY 50, ingest missing candles and create the demo account. */
+  SEED_ON_START: flag,
+  SEED_HISTORY_DAYS: z.coerce.number().int().positive().default(730),
+  /** Enables POST /internal/jobs/:job for an external scheduler (e.g. GitHub Actions cron). */
+  CRON_SECRET: z.string().min(24, 'CRON_SECRET must be at least 24 characters').optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
